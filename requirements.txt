@@ -1,0 +1,6 @@
+Flask
+PuLP
+# gunicorn
+# waitress   # For running the service on Linux/macOS (recommended)
+# OR
+# waitress # For running on Windows or simpler cross-platform setup
