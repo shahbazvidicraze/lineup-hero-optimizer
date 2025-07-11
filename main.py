@@ -197,7 +197,7 @@ def optimize_lineup():
         # --- Process Results ---
         # Use imported constants directly
         if prob.status == LpStatusInfeasible:
-             error_msg = "Optimization failed: Infeasible. Check conflicting fixed assignments or constraints. Common cause: Trying to bench a player when team size equals positions (e.g., 9 players), or fixing too many players to one position."
+             error_msg = "Optimization failed: Trying to out a player when team size equals positions (e.g., 9 players), or fixing too many players to one position."
              print(error_msg, file=sys.stderr)
              raise ValueError(error_msg) # Raise ValueError for 400 response
         elif prob.status not in [LpStatusOptimal, LpStatusUndefined]: # Allow Undefined (timeout with solution)
