@@ -71,7 +71,6 @@ def optimize_lineup():
               f" Players: {players_str}\n"
               f" Game Innings: {game_innings}\n"
               f" Fixed Assign Type: {type(fixed_assignments)}\n"
-              #f" Fixed Assign Keys: {list(fixed_assignments.keys())}\n" # Less verbose
               f" Actual Counts Type: {type(actual_counts_input)}\n"
               f" Preferences Type: {type(player_preferences)}\n"
               , file=sys.stderr)
@@ -136,8 +135,25 @@ def optimize_lineup():
                      print(f"Warning: Invalid fixed assignment format for player {p_id}, inning {inning_str}, pos {fixed_pos}: {e}", file=sys.stderr)
 
 
+        # ######################################################################
+        # ##########                  START OF FIX                  ##########
+        # ######################################################################
+
+        # 4. Explicitly define the number of benched players per inning.
+        # This is the crucial fix. It prevents logical contradictions when a user
+        # tries to fix a player to "OUT" when the team size equals the number of
+        # main positions (e.g., 9 players for 9 positions).
+        num_on_bench = max(0, len(players_str) - len(MAIN_POSITIONS))
+        for i in range(1, game_innings + 1):
+            prob += lpSum(X[p_id][i]["OUT"] for p_id in players_str) == num_on_bench, f"BenchCount_{i}"
+
+        # ######################################################################
+        # ##########                   END OF FIX                   ##########
+        # ######################################################################
+
+
         # --- Objective Function Terms ---
-        # 4. Bench Time Fairness
+        # 5. Bench Time Fairness
         bench_counts = { p_id: lpSum(X[p_id][i]["OUT"] for i in range(1, game_innings + 1)) for p_id in players_str }
         d = {p_id: LpVariable(f"d_{p_id}", lowBound=0, cat=LpContinuous) for p_id in players_str}
         for p_id in players_str:
@@ -148,7 +164,7 @@ def optimize_lineup():
             prob += target_bench_innings - final_bench_innings <= d[p_id], f"BenchDev2_{p_id}"
         bench_deviation_objective = BENCH_DEVIATION_WEIGHT * lpSum(d[p_id] for p_id in players_str)
 
-        # 5. Preference Penalties
+        # 6. Preference Penalties
         preference_penalty_objective = []
         for p_id in players_str:
             prefs = player_preferences.get(p_id, {})
@@ -181,7 +197,7 @@ def optimize_lineup():
         # --- Process Results ---
         # Use imported constants directly
         if prob.status == LpStatusInfeasible:
-             error_msg = "Optimization failed: Infeasible. Check conflicting fixed assignments or constraints."
+             error_msg = "Optimization failed: Infeasible. Check conflicting fixed assignments or constraints. Common cause: Trying to bench a player when team size equals positions (e.g., 9 players), or fixing too many players to one position."
              print(error_msg, file=sys.stderr)
              raise ValueError(error_msg) # Raise ValueError for 400 response
         elif prob.status not in [LpStatusOptimal, LpStatusUndefined]: # Allow Undefined (timeout with solution)
@@ -223,11 +239,3 @@ def optimize_lineup():
         tb_str = traceback.format_exc() # Get full traceback
         print(f"Error during optimization: {err_type} - {err_msg}\nTraceback:\n{tb_str}", file=sys.stderr)
         return jsonify({"error": f"Internal optimization error: {err_type} - {err_msg}", "input_sent_by_client": input_data}), 500
-
-# Run with: gunicorn --workers 3 --bind 0.0.0.0:5000 main:app
-# Or: waitress-serve --host 0.0.0.0 --port 5000 main:app
-
-# if __name__ == '__main__':
-#     import os
-#     port = int(os.environ.get("PORT", 8080))
-#     app.run(host='0.0.0.0', port=port,debug=True)
