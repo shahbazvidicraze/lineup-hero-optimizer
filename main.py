@@ -197,7 +197,7 @@ def optimize_lineup():
         # --- Process Results ---
         # Use imported constants directly
         if prob.status == LpStatusInfeasible:
-             error_msg = "Optimization failed: Trying to out a player when team size equals positions (e.g., 9 players), or fixing too many players to one position."
+             error_msg = "Autocomplete Lineup failed: may be due to benching players when team size equals positions (e.g. 9) or assigning too many players to the same position (e.g., OUT)."
              print(error_msg, file=sys.stderr)
              raise ValueError(error_msg) # Raise ValueError for 400 response
         elif prob.status not in [LpStatusOptimal, LpStatusUndefined]: # Allow Undefined (timeout with solution)
