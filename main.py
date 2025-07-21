@@ -1,9 +1,9 @@
 # main.py (Lineup Optimizer Service)
 
 import sys
-import traceback
-import time
+import traceback # For detailed error logging
 from flask import Flask, request, jsonify
+# Modified pulp import to include necessary constants:
 from pulp import (
     LpProblem,
     LpMinimize,
@@ -15,178 +15,227 @@ from pulp import (
     PULP_CBC_CMD,
     LpStatus,
     LpStatusOptimal,
+    LpStatusNotSolved,
     LpStatusInfeasible,
-    LpStatusUndefined,
-    getSolver # To select a different solver if available
+    LpStatusUnbounded,
+    LpStatusUndefined
 )
 
 # --- Configuration ---
 RESTRICTED_POSITION_PENALTY = 1000.0
 NOT_PREFERRED_PENALTY = 10.0
 BENCH_DEVIATION_WEIGHT = 1.0
-SOLVER_TIME_LIMIT = 55 # Seconds
+SOLVER_TIME_LIMIT = 55 # Seconds, should be less than Laravel HTTP timeout
 
-ALL_POSITIONS = ["CF", "LF", "RF", "SS", "1B", "2B", "3B", "P", "C", "OUT"]
+POSITIONS = ["CF", "LF", "RF", "SS", "1B", "2B", "3B", "P", "C", "OUT"]
 MAIN_POSITIONS = ["CF", "LF", "RF", "SS", "1B", "2B", "3B", "P", "C"]
 # --- End Configuration ---
 
+
 app = Flask(__name__)
-
-# --- OPTIMIZATION 1: Try to use a faster solver if installed ---
-# HiGHS is a high-performance open-source solver that PuLP can use.
-# If you run `pip install highspy` in your Python environment, this code will use it.
-# Otherwise, it falls back to the default CBC.
-SOLVER = getSolver('HiGHS_CMD', msg=0, timeLimit=SOLVER_TIME_LIMIT)
-if not SOLVER.available():
-    print("HiGHS solver not found. Falling back to default CBC solver.", file=sys.stderr)
-    SOLVER = PULP_CBC_CMD(msg=0, timeLimit=SOLVER_TIME_LIMIT)
-
 
 @app.route('/')
 def hello():
     return "Hello Boss!"
-
 @app.route('/optimize', methods=['POST'])
 def optimize_lineup():
-    start_time = time.time()
     input_data = None
     try:
         input_data = request.get_json()
-        if input_data is None: raise ValueError("No JSON input received.")
+        if input_data is None:
+            raise ValueError("No JSON input received.")
 
         # --- Input Parsing and Validation ---
         players_str = input_data.get("players", [])
-        if not players_str: raise ValueError("'players' field must be a non-empty list.")
-        game_innings = input_data.get("game_innings", 6)
-        fixed_assignments = input_data.get("fixed_assignments", {})
-        actual_counts_input = input_data.get("actual_counts", {})
-        player_preferences = input_data.get("player_preferences", {})
+        if not players_str or not isinstance(players_str, list):
+             raise ValueError("'players' field must be a non-empty list.")
 
-        print(f"Received {len(players_str)} players for {game_innings} innings.", file=sys.stderr)
+        fixed_assignments = input_data.get("fixed_assignments", {})
+        if not isinstance(fixed_assignments, dict):
+             raise ValueError("'fixed_assignments' field must be an object (dictionary).")
+
+        actual_counts_input = input_data.get("actual_counts", {})
+        if not isinstance(actual_counts_input, dict):
+            raise ValueError("'actual_counts' field must be an object (dictionary).")
+
+        game_innings = input_data.get("game_innings", 6)
+        if not isinstance(game_innings, int) or game_innings <= 0:
+            raise ValueError("'game_innings' must be a positive integer.")
+
+        player_preferences = input_data.get("player_preferences", {})
+        if not isinstance(player_preferences, dict):
+             raise ValueError("'player_preferences' field must be an object (dictionary).")
+
+        # Optional: Log less verbosely in production if needed
+        print(f"Received Input:\n"
+              f" Players: {players_str}\n"
+              f" Game Innings: {game_innings}\n"
+              f" Fixed Assign Type: {type(fixed_assignments)}\n"
+              f" Actual Counts Type: {type(actual_counts_input)}\n"
+              f" Preferences Type: {type(player_preferences)}\n"
+              , file=sys.stderr)
+
 
         # --- Data Preprocessing ---
-        actual_counts = {
-            p_id: {pos: float(actual_counts_input.get(p_id, {}).get(pos, 0)) for pos in ALL_POSITIONS}
-            for p_id in players_str
+        actual_counts = {}
+        for p_id in players_str:
+            counts = actual_counts_input.get(p_id, {})
+            if not isinstance(counts, dict):
+                 print(f"Warning: Invalid actual_counts structure for player {p_id}. Expected dict, got {type(counts)}. Using empty.", file=sys.stderr)
+                 counts = {}
+            actual_counts[p_id] = {pos: float(counts.get(pos, 0)) for pos in POSITIONS}
+
+        total_current = {
+            p_id: sum(actual_counts[p_id].values()) for p_id in players_str
         }
-        total_current = { p_id: sum(actual_counts[p_id].values()) for p_id in players_str }
-        total_actual_out = sum(counts.get("OUT", 0) for counts in actual_counts.values())
+
+        total_actual_out = sum(actual_counts[p_id].get("OUT", 0) for p_id in players_str)
         total_new_out = game_innings * max(0, (len(players_str) - len(MAIN_POSITIONS)))
+
         sum_T = sum(total_current.values()) + (game_innings * len(players_str))
         target_bench_ratio = (total_actual_out + total_new_out) / sum_T if sum_T > 0 else 0
 
         # --- PuLP Model Setup ---
         prob = LpProblem("LineupAssignment", LpMinimize)
-        innings_range = range(1, game_innings + 1)
-
-        # --- OPTIMIZATION 2: Create variables more efficiently ---
-        X = LpVariable.dicts("pos", (players_str, innings_range, ALL_POSITIONS), cat=LpBinary)
-
-        # List to hold all objective function terms, to be summed once at the end.
-        objective_terms = []
-
-        # --- OPTIMIZATION 3: More efficient preference lookups ---
-        # Convert preference lists to sets for much faster "in" checks inside loops.
-        prefs_as_sets = {}
-        for p_id in players_str:
-            player_pref = player_preferences.get(p_id, {})
-            prefs_as_sets[p_id] = {
-                'preferred': set(player_pref.get('preferred', [])),
-                'restricted': set(player_pref.get('restricted', []))
+        X = {
+            p_id: {
+                i: { pos: LpVariable(f"X_{p_id}_{i}_{pos}", cat=LpBinary) for pos in POSITIONS }
+                for i in range(1, game_innings + 1)
             }
+            for p_id in players_str
+        }
 
-        # --- Constraints & Objective Function ---
-        # We combine constraint and objective creation in the same loops to reduce overhead.
-
+        # --- Constraints ---
         # 1. One position per player per inning
         for p_id in players_str:
-            for i in innings_range:
-                prob += lpSum(X[p_id][i][pos] for pos in ALL_POSITIONS) == 1, f"OnePos_{p_id}_{i}"
+            for i in range(1, game_innings + 1):
+                prob += lpSum(X[p_id][i][pos] for pos in POSITIONS) == 1, f"OnePos_{p_id}_{i}"
 
         # 2. One player per main position per inning
-        for i in innings_range:
+        for i in range(1, game_innings + 1):
             for pos in MAIN_POSITIONS:
                 prob += lpSum(X[p_id][i][pos] for p_id in players_str) == 1, f"MainPos_{pos}_{i}"
 
         # 3. Fixed assignments
-        for p_id, assignments in fixed_assignments.items():
+        for p_id, assignments in fixed_assignments.items(): # Safe due to input validation
             if p_id not in players_str: continue
+            if not isinstance(assignments, dict):
+                 print(f"Warning: Invalid fixed assignment value for player {p_id}. Expected dict, got {type(assignments)}. Skipping.", file=sys.stderr)
+                 continue
             for inning_str, fixed_pos in assignments.items():
-                inning = int(inning_str)
-                if 1 <= inning <= game_innings and fixed_pos in ALL_POSITIONS:
-                    prob += X[p_id][inning][fixed_pos] == 1, f"Fixed_{p_id}_{inning}"
+                try:
+                    inning = int(inning_str)
+                    # Ensure position is valid before adding constraint
+                    if 1 <= inning <= game_innings and fixed_pos in POSITIONS:
+                        prob += X[p_id][inning][fixed_pos] == 1, f"Fixed_{p_id}_{inning}_{fixed_pos}"
+                    elif fixed_pos not in POSITIONS:
+                        print(f"Warning: Invalid position '{fixed_pos}' in fixed assignment for player {p_id}, inning {inning}. Skipping.", file=sys.stderr)
 
-        # 4. Enforce bench count per inning
+                except (ValueError, KeyError) as e:
+                     print(f"Warning: Invalid fixed assignment format for player {p_id}, inning {inning_str}, pos {fixed_pos}: {e}", file=sys.stderr)
+
+
+        # ######################################################################
+        # ##########                  START OF FIX                  ##########
+        # ######################################################################
+
+        # 4. Explicitly define the number of benched players per inning.
+        # This is the crucial fix. It prevents logical contradictions when a user
+        # tries to fix a player to "OUT" when the team size equals the number of
+        # main positions (e.g., 9 players for 9 positions).
         num_on_bench = max(0, len(players_str) - len(MAIN_POSITIONS))
-        for i in innings_range:
+        for i in range(1, game_innings + 1):
             prob += lpSum(X[p_id][i]["OUT"] for p_id in players_str) == num_on_bench, f"BenchCount_{i}"
 
+        # ######################################################################
+        # ##########                   END OF FIX                   ##########
+        # ######################################################################
+
+
+        # --- Objective Function Terms ---
         # 5. Bench Time Fairness
-        d = LpVariable.dicts("dev", players_str, lowBound=0)
+        bench_counts = { p_id: lpSum(X[p_id][i]["OUT"] for i in range(1, game_innings + 1)) for p_id in players_str }
+        d = {p_id: LpVariable(f"d_{p_id}", lowBound=0, cat=LpContinuous) for p_id in players_str}
         for p_id in players_str:
-            bench_count = lpSum(X[p_id][i]["OUT"] for i in innings_range)
-            target_bench = target_bench_ratio * (total_current[p_id] + game_innings)
-            final_bench = actual_counts[p_id].get("OUT", 0) + bench_count
-            prob += final_bench - target_bench <= d[p_id], f"BenchDev1_{p_id}"
-            prob += target_bench - final_bench <= d[p_id], f"BenchDev2_{p_id}"
-        # Add the deviation cost to our objective terms list
-        objective_terms.append(BENCH_DEVIATION_WEIGHT * lpSum(d))
+            target_bench_innings = target_bench_ratio * (total_current[p_id] + game_innings)
+            # Use .get() for safety if actual_counts might miss OUT key somehow
+            final_bench_innings = actual_counts[p_id].get("OUT", 0) + bench_counts[p_id]
+            prob += final_bench_innings - target_bench_innings <= d[p_id], f"BenchDev1_{p_id}"
+            prob += target_bench_innings - final_bench_innings <= d[p_id], f"BenchDev2_{p_id}"
+        bench_deviation_objective = BENCH_DEVIATION_WEIGHT * lpSum(d[p_id] for p_id in players_str)
 
-        # --- OPTIMIZATION 4: Pre-calculate all penalty costs ---
-        # This is the most significant optimization. Instead of appending to a list inside
-        # the loops, we generate all penalty terms with a single list comprehension.
-        penalty_terms = []
+        # 6. Preference Penalties
+        preference_penalty_objective = []
         for p_id in players_str:
-            player_prefs = prefs_as_sets[p_id]
-            restricted = player_prefs['restricted']
-            preferred = player_prefs['preferred']
-            for i in innings_range:
-                for pos in ALL_POSITIONS:
+            prefs = player_preferences.get(p_id, {})
+            if not isinstance(prefs, dict):
+                 print(f"Warning: Invalid structure for preferences for player {p_id}. Expected dict, got {type(prefs)}. Using empty.", file=sys.stderr)
+                 prefs = {}
+            preferred = set(prefs.get("preferred", [])) if isinstance(prefs.get("preferred"), list) else set()
+            restricted = set(prefs.get("restricted", [])) if isinstance(prefs.get("restricted"), list) else set()
+
+            for i in range(1, game_innings + 1):
+                for pos in POSITIONS:
+                    # Penalize restricted positions
                     if pos in restricted:
-                        penalty_terms.append(RESTRICTED_POSITION_PENALTY * X[p_id][i][pos])
+                        preference_penalty_objective.append(RESTRICTED_POSITION_PENALTY * X[p_id][i][pos])
+                    # Penalize non-preferred positions (only if not OUT and not preferred)
                     elif pos != "OUT" and pos not in preferred:
-                        penalty_terms.append(NOT_PREFERRED_PENALTY * X[p_id][i][pos])
-
-        objective_terms.extend(penalty_terms)
+                         preference_penalty_objective.append(NOT_PREFERRED_PENALTY * X[p_id][i][pos])
 
         # --- Combine Objective Terms ---
-        # Summing all objective terms together in one go is much faster.
-        prob += lpSum(objective_terms), "TotalObjective"
-        
-        setup_time = time.time() - start_time
-        print(f"Model setup took: {setup_time:.4f} seconds.", file=sys.stderr)
+        prob += bench_deviation_objective + lpSum(preference_penalty_objective), "TotalObjective"
 
         # --- Solve the Model ---
-        prob.solve(SOLVER)
-        solve_status = LpStatus[prob.status]
+        print("Solving MILP problem...", file=sys.stderr)
+        # msg=1 shows solver output, msg=0 hides it
+        solver = PULP_CBC_CMD(msg=0, timeLimit=SOLVER_TIME_LIMIT)
+        prob.solve(solver)
+        solve_status = LpStatus[prob.status] # Use imported LpStatus dictionary
         print(f"Solver status: {solve_status}", file=sys.stderr)
-        
-        if prob.status == LpStatusInfeasible:
-            raise ValueError("Infeasible model. This may be due to conflicting fixed assignments.")
-        if prob.status not in [LpStatusOptimal, LpStatusUndefined]:
-             print(f"Warning: Optimal solution not found ({solve_status}). Using best found solution.", file=sys.stderr)
-        if any(X[p_id][i][pos].varValue is None for p_id in players_str for i in innings_range for pos in ALL_POSITIONS):
-             raise ValueError(f"Solver timed out after {SOLVER_TIME_LIMIT}s without finding a feasible solution.")
 
         # --- Process Results ---
+        # Use imported constants directly
+        if prob.status == LpStatusInfeasible:
+             error_msg = "Autocomplete Lineup failed: may be due to benching players when team size equals positions (e.g. 9) or assigning too many players to the same position (e.g., OUT)."
+             print(error_msg, file=sys.stderr)
+             raise ValueError(error_msg) # Raise ValueError for 400 response
+        elif prob.status not in [LpStatusOptimal, LpStatusUndefined]: # Allow Undefined (timeout with solution)
+             print(f"Warning: Optimal solution not guaranteed ({solve_status}). Using best found solution.", file=sys.stderr)
+        elif prob.status == LpStatusOptimal:
+              print("Optimal solution found.", file=sys.stderr)
+
+        # Check if variable values are None (can happen on timeout before feasible solution found)
+        if any(value(X[p_id][i][pos]) is None for p_id in players_str for i in range(1, game_innings + 1) for pos in POSITIONS):
+             error_msg = f"Optimization failed: Solver timed out ({SOLVER_TIME_LIMIT}s) before finding a feasible solution."
+             print(error_msg, file=sys.stderr)
+             raise ValueError(error_msg) # Raise ValueError for 400 response
+
+
         output_json = []
         for p_id in players_str:
             player_assignments = {"player_id": p_id, "innings": {}}
-            for i in innings_range:
-                for pos in ALL_POSITIONS:
-                    if X[p_id][i][pos].varValue > 0.5: # More robust check than == 1
-                        player_assignments["innings"][str(i)] = pos
-                        break
+            for i in range(1, game_innings + 1):
+                assigned_pos = "ERR" # Default error marker
+                for pos in POSITIONS:
+                    var_value = value(X[p_id][i][pos])
+                    if var_value is not None and round(var_value) == 1:
+                        assigned_pos = pos
+                        break # Found the assigned position for this inning
+                player_assignments["innings"][str(i)] = assigned_pos # Store inning key as string
             output_json.append(player_assignments)
 
-        total_time = time.time() - start_time
-        print(f"Optimization successful. Total time: {total_time:.4f} seconds.", file=sys.stderr)
+        print("Optimization successful. Returning lineup.", file=sys.stderr)
         return jsonify(output_json)
 
     except ValueError as ve:
+         # Client-side/Data validation errors
          print(f"Value Error: {ve}", file=sys.stderr)
          return jsonify({"error": str(ve), "input_received": input_data}), 400
     except Exception as e:
-        tb_str = traceback.format_exc()
-        print(f"Error during optimization: {type(e).__name__} - {e}\nTraceback:\n{tb_str}", file=sys.stderr)
-        return jsonify({"error": f"Internal optimization error: {type(e).__name__} - {e}"}), 500
+        # Server-side/Unexpected errors
+        err_type = type(e).__name__
+        err_msg = str(e)
+        tb_str = traceback.format_exc() # Get full traceback
+        print(f"Error during optimization: {err_type} - {err_msg}\nTraceback:\n{tb_str}", file=sys.stderr)
+        return jsonify({"error": f"Internal optimization error: {err_type} - {err_msg}", "input_sent_by_client": input_data}), 500
